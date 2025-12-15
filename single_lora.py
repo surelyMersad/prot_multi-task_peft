@@ -25,9 +25,6 @@ from transformers import BitsAndBytesConfig
 
 
 
-
-
-
 # ============================================================
 # Multi-assay Dataset
 # ============================================================
@@ -54,12 +51,14 @@ class DMSMultiAssayDataset(Dataset):
         tokenizer,
         max_length=1024,
         max_per_assay: int | None = None,
-        min_score_margin: float = 0.2
+        min_score_margin: float = 0.2,
+        max_score_margin: float = 0.8
     ):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.min_score_margin = min_score_margin
+        self.max_score_margin = max_score_margin
 
         dms_dir = Path(dms_dir)
         csv_files = sorted(dms_dir.glob("*.csv"))
@@ -111,10 +110,10 @@ class DMSMultiAssayDataset(Dataset):
 
             def parse_pos(mut_str):
                 # extract all digits in the mutation, e.g. "A123C" → "123"
+                # check for multiple mutations (e.g. "A123C:G124D") and return a list of integers for mutation positions
                 pos = re.findall(r'\d+', mut_str)
-                if len(pos) == 0:
-                    raise ValueError(f"Cannot find position in mutation {mut_str}")
-                return int(pos[0]) - 1  # 0-based
+                # return [int(p) - 1 for p in pos]  # 0-based
+                return int(pos[0]) - 1  # only first mutation position, 0-based
 
             for _, row in df.iterrows():
                 seq = str(row[seq_col])
@@ -123,6 +122,7 @@ class DMSMultiAssayDataset(Dataset):
                 pos = parse_pos(mut_str)
 
                 # --- SKIP if out of range ---
+                # if any(p < 0 or p >= len(seq) or p >= self.max_length for p in pos):
                 if pos < 0 or pos >= len(seq) or pos >= self.max_length:
                     continue
                 # ----------------------------
@@ -165,7 +165,7 @@ class DMSMultiAssayDataset(Dataset):
                 "input_ids": enc["input_ids"].squeeze(0),
                 "attention_mask": enc["attention_mask"].squeeze(0),
                 "mut_pos": torch.tensor(self.mut_pos[idx], dtype=torch.long),
-                "score": self.labels[idx] # Keep raw score for comparison
+                "score": self.labels[idx]
             }
 
     def __getitem__(self, idx):
@@ -174,12 +174,12 @@ class DMSMultiAssayDataset(Dataset):
 
         candidates = self.indices_by_task[task_id]
         idx_b = idx
-        for _ in range(25):  # try up to 25 times to find a valid partner
+        for _ in range(10):  # try up to 10 times to find a valid partner
             rand_idx = np.random.choice(candidates)
             if rand_idx == idx : 
                 continue
             score_b = self.labels[rand_idx]
-            if abs(score_a - score_b) >= self.min_score_margin:
+            if abs(score_a - score_b) >= self.min_score_margin and abs(score_a - score_b) <= self.max_score_margin:
                 idx_b = rand_idx
                 break
 
@@ -214,7 +214,7 @@ class DMSMultiAssayDataset(Dataset):
             "rejected_mut_pos": item_rejected["mut_pos"],
 
             "task_id": torch.tensor(task_id, dtype=torch.long),
-            "labels": torch.tensor([score_chosen, score_rejected], dtype=torch.float32)
+            "labels": torch.tensor(score_chosen, dtype=torch.float32), # Specifically we use chosen score as label
         }
 # ============================================================
 # Data Collator
@@ -236,6 +236,38 @@ def pairwise_collate_fn(batch):
         
     return batch_data
 
+# ============================================================
+# Create Dataset Split
+# ============================================================
+
+def create_dataset_split(dataset, dms_dir, split_ratio=0.9, seed=42):
+
+    assay_to_uniport = parse_data(dms_dir, dataset)
+    # 1. Map Task IDs to UniProt
+    task_to_prot = {i: assay_to_uniport[name] for i, name in enumerate(dataset.assay_names)}
+
+    # 2. Split Unique Proteins
+    np.random.seed(seed)
+    unique_prots = list(set(task_to_prot.values()))
+    np.random.shuffle(unique_prots)
+    train_prots = set(unique_prots[:int(split_ratio * len(unique_prots))])
+
+    # 3. Identify which Task IDs belong to Train
+    train_tasks = {t for t, p in task_to_prot.items() if p in train_prots}
+
+    # 4. Create Subsets (Vectorized for speed)
+    all_task_ids = np.array(dataset.task_ids)
+    is_train = np.isin(all_task_ids, list(train_tasks))
+
+    train_dataset = Subset(dataset, np.where(is_train)[0])
+    eval_indices = np.where(~is_train)[0]
+    if len(eval_indices) > 1024:
+        rng = np.random.default_rng(42)
+        eval_indices = rng.choice(eval_indices, size=1024, replace=False)
+
+    eval_dataset = Subset(dataset, eval_indices)
+    return train_dataset, eval_dataset
+    
 # ============================================================
 # Reward Model Layer
 # ============================================================
@@ -274,66 +306,41 @@ class ProteinRewardModel(nn.Module):
     ):
 
         # ======================================================
-        # MODE 1: Pairwise Training (Bradley-Terry Loss)
+        # Pairwise Training (Bradley-Terry Loss)
         # ======================================================
-        if chosen_input_ids is not None and rejected_input_ids is not None:
+        input_ids = torch.cat([chosen_input_ids, rejected_input_ids], dim=0)
+        attention_mask = torch.cat([chosen_attention_mask, rejected_attention_mask], dim=0)
+        mut_pos = torch.cat([chosen_mut_pos, rejected_mut_pos], dim=0)
 
-            input_ids = torch.cat([chosen_input_ids, rejected_input_ids], dim=0)
-            attention_mask = torch.cat([chosen_attention_mask, rejected_attention_mask], dim=0)
-            mut_pos = torch.cat([chosen_mut_pos, rejected_mut_pos], dim=0)
+        # Base Model Forward
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            output_router_logits=False,  # Disable MoE auxiliary loss to avoid tensor size mismatch
+            **kwargs
+        )
+        # Extract hidden states (last layer)
+        last_hidden = outputs.hidden_states[-1]  # [B, L, H]
 
-            # Base Model Forward
-            outputs = self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                **kwargs
-            )
-            # Extract hidden states (last layer)
-            last_hidden = outputs.hidden_states[-1]
-            
-            # 3. Extract embeddings at mutation positions
-            batch_indices = torch.arange(last_hidden.size(0), device=last_hidden.device)
-            target_embeddings = last_hidden[batch_indices, mut_pos]  # [B, H]
-            target_embeddings = target_embeddings.to(self.score_head.weight.dtype)  # ensure dtype match
+        
+        # 3. Extract embeddings at mutation positions
+        batch_indices = torch.arange(last_hidden.size(0), device=last_hidden.device)
+        target_embeddings = last_hidden[batch_indices, mut_pos]  # [B, H]
+        target_embeddings = target_embeddings.to(self.score_head.weight.dtype)  # ensure dtype match
 
-            # Predict Rewards (Fitness Scores)
-            all_rewards = self.score_head(target_embeddings).squeeze(-1)  # [B]
-            
-            # Split and compute loss
-            B = chosen_input_ids.size(0)
-            chosen_rewards = all_rewards[:B]
-            rejected_rewards = all_rewards[B:]
+        # Predict Rewards (Fitness Scores)
+        all_rewards = self.score_head(target_embeddings).squeeze(-1)  # [B]
+        
+        # Split and compute loss
+        B = chosen_input_ids.size(0)
+        chosen_rewards = all_rewards[:B]
+        rejected_rewards = all_rewards[B:]
 
-            # Loss : Maximize log(sigmoid(chosen - rejected ))
-            loss = -F.logsigmoid(chosen_rewards - rejected_rewards).mean()
+        # Loss : Maximize log(sigmoid(chosen - rejected ))
+        loss = -F.logsigmoid(chosen_rewards - rejected_rewards).mean()
 
-            return {"loss": loss, "chosen_rewards": chosen_rewards, "rejected_rewards": rejected_rewards}
-
-        # ======================================================
-        # MODE 2: Single Inference (Scoring)
-        # ======================================================
-        else:
-            # Standard path for validating Spearman correlation or inference
-            outputs = self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                **kwargs
-            )
-            hidden_states = outputs.hidden_states[-1]
-            
-            batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
-            regression_inputs = hidden_states[batch_indices, mut_pos]
-            regression_inputs = regression_inputs.to(self.score_head.weight.dtype)
-
-            scores = self.score_head(regression_inputs).squeeze(-1)
-
-            return {
-                'loss': None,
-                'logits': scores # These are your predicted fitness values
-            }
-
+        return {"loss": loss, "chosen_rewards": chosen_rewards, "rejected_rewards": rejected_rewards, "logits": chosen_rewards,} # Return chosen_rewards as logits for compatibility
 
 # ============================================================
 # Lora Config for different adaptors
@@ -341,28 +348,30 @@ class ProteinRewardModel(nn.Module):
 
 def get_lora_config(task: str) -> LoraConfig:
 
+    # Configuration for Task A (Attention layers)
     lora_config_task_a = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,   # this is still correct for JambaForCausalLM
-        r=8,
-        lora_alpha=32,
-        target_modules=["gate_proj", "up_proj", "down_proj"],
-        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        r=4,
+        lora_alpha=1,
+        target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+        bias="all",
+        modules_to_save=["score_head"],
     )
 
-    # Configuration for Task B (e.g., Sentiment Analysis)
+    # Configuration for Task B (MLP layers)
     lora_config_task_b = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
-        r=4, # Lower rank for Task B
-        lora_alpha=8,
-        # lora_dropout=0.1,
-        target_modules=["c_proj"], # Example: Target different layers for Task B
-        bias="none",
+        r=4,
+        target_modules=["gate_proj", "up_proj", "down_proj"],
+        lora_alpha=1,
+        bias="all",
+        modules_to_save=["score_head"],
     )
 
 
-    if task == "task_a":
+    if task == "Attention":
         return lora_config_task_a
-    elif task == "task_b":
+    elif task == "MLP":
         return lora_config_task_b
     else:
         raise ValueError(f"Unknown task: {task}")
@@ -372,35 +381,19 @@ def get_lora_config(task: str) -> LoraConfig:
 # ============================================================
 
 def compute_metrics(eval_pred):
-    # Unpack Predictions
-    # The Trainer passes the output of forward() (minus 'loss') as a tuple.
-    # index 0: chosen_rewards [Batch_Size, 1]
-    # index 1: rejected_rewards [Batch_Size, 1]
-    chosen_preds, rejected_preds = eval_pred.predictions
-    
-    # Unpack Labels
-    # label_ids shape is [Batch_Size, 2] because we stacked [score_chosen, score_rejected]
-    labels = eval_pred.label_ids
-    chosen_labels = labels[:, 0]
-    rejected_labels = labels[:, 1]
-    
-    # Flatten everything to 1D arrays
-    # We concatenate chosen and rejected to create one giant list of "All Predictions" vs "All Truths"
-    all_preds = np.concatenate([chosen_preds.flatten(), rejected_preds.flatten()])
-    all_labels = np.concatenate([chosen_labels.flatten(), rejected_labels.flatten()])
-    
-    # Calculate Spearman
-    spearman, _ = spearmanr(all_labels, all_preds)
-    
-    # Optional: Calculate Pairwise Accuracy (How often did we guess the winner right?)
-    # Since we defined chosen as the one with higher score, predictions should be chosen > rejected
-    num_correct = np.sum(chosen_preds > rejected_preds)
-    accuracy = num_correct / len(chosen_preds)
-    
-    return {
-        "spearman": spearman,
-        "pairwise_accuracy": accuracy
-    }
+    preds, labels = eval_pred
+
+    # preds is a list where the first element is chosen-rewards, second is rejected-rewards and third is logits(same as chosen-rewards)
+    chosen_rewards = preds[0]
+    rejected_rewards = preds[1]
+    logits = preds[2]
+
+    logits = np.asarray(chosen_rewards).reshape(-1)
+    labels = np.asarray(labels).reshape(-1)
+
+
+    rho, _ = spearmanr(labels, chosen_rewards)
+    return {"spearman": float(rho)}
 
 # ============================================================
 # Parse Data
@@ -420,6 +413,38 @@ def parse_data(dms_dir, dataset):
     return assay_to_uniport
 
 # ============================================================
+# Custom Trainer (if needed)
+# ============================================================
+
+class CustomRewardTrainer(Trainer):
+
+    # This will only work for multi-GPU?
+    def save_model(self, output_dir=None, _internal_call=False):
+        # 1. Let the parent class handle standard saving (LoRA, Optimizer, creation of folder)
+        super().save_model(output_dir, _internal_call)
+        
+        # 2. CRITICAL FIX: Only the Main Process (Rank 0) should save the custom head
+        if self.args.process_index == 0:
+            
+            # Determine directory
+            if output_dir is None:
+                output_dir = self.args.output_dir
+            
+            # Safety: Ensure directory exists (just in case super() didn't create it yet)
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Unwrap DDP if necessary
+            model_to_save = self.model
+            if hasattr(model_to_save, 'module'):
+                model_to_save = model_to_save.module
+            
+            # Save the score head
+            if hasattr(model_to_save, 'score_head'):
+                save_path = os.path.join(output_dir, "score_head.pt")
+                torch.save(model_to_save.score_head.state_dict(), save_path)
+                # print(f"Saved score_head to {save_path}") # Optional logging
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -428,36 +453,48 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dms_dir", type=str, required=True, help="Directory with DMS CSV files")
     parser.add_argument("--model_name", type=str, default="microsoft/Dayhoff-170m-UR50-BRq", help="Pretrained model name or path")
-    parser.add_argument("--output_dir", type=str, default=f"./multi_c_output", help="Output directory for model checkpoints")
+    parser.add_argument("--output_dir", type=str, default=f"./output", help="Output directory for model checkpoints")
     parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
     parser.add_argument("--max_per_assay", type=int, default=1000, help="Maximum examples per assay")
-    parser.add_argument("--num_train_epochs", type=int, default=4, help="Number of training epochs")
+    parser.add_argument("--num_train_epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="Training batch size per device")
     parser.add_argument("--per_device_eval_batch_size", type=int, default=4, help="Evaluation batch size per device")
-    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
+    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--logging_steps", type=int, default=50, help="Logging steps")
     parser.add_argument("--save_steps", type=int, default=100, help="Model save steps")
     parser.add_argument("--wandb_project", type=str, default="multi_assay_protein_dms", help="Weights & Biases project name")
-    parser.add_argument("--task", type=str, choices=["task_a", "task_b"], required=True, help="Task type for LoRA configuration")
+    parser.add_argument("--task", type=str, choices=["MLP", "Attention"], required=True, help="Task type for LoRA configuration")
     args = parser.parse_args()
 
 
     print(args)
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_8bit=True,             # 8-bit weights
-        llm_int8_threshold=6.0,        # default is fine
-        llm_int8_has_fp16_weight=False # usually False for full 8-bit
-    )
+    # Get the local rank (0 to 6) from the environment variable set by accelerate
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    device_map = None
+
+    if local_rank != -1:
+        # DDP: Force model to the specific GPU for this process
+        device_map = {"": local_rank}
+    else:
+        # Single GPU fallback
+        device_map = "auto"
+
+    print(f"Process Rank {local_rank}: Loading model...")
+
     # Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
 
+    # Load base model with bfloat16 precision
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         trust_remote_code=True,
-        quantization_config=bnb_config,
-        device_map="auto"   # let HF place it on GPUs
+        device_map=device_map,
+        dtype=torch.bfloat16, # explicitly load the based model in bfloat16
+        output_router_logits=False,  # Disable MoE auxiliary loss to avoid tensor size mismatch
     )
+
+
 
     
     # Get hidden size from model config
@@ -471,42 +508,8 @@ def main():
         max_per_assay=args.max_per_assay,
     )
 
-    assay_to_uniport = parse_data(args.dms_dir, dataset)
-    # 1. Map Task IDs to UniProt
-    task_to_prot = {i: assay_to_uniport[name] for i, name in enumerate(dataset.assay_names)}
 
-    # 2. Split Unique Proteins
-    unique_prots = list(set(task_to_prot.values()))
-    np.random.shuffle(unique_prots)
-    train_prots = set(unique_prots[:int(0.9 * len(unique_prots))])
-
-    # 3. Identify which Task IDs belong to Train
-    train_tasks = {t for t, p in task_to_prot.items() if p in train_prots}
-
-    # 4. Create Subsets (Vectorized for speed)
-    all_task_ids = np.array(dataset.task_ids)
-    is_train = np.isin(all_task_ids, list(train_tasks))
-
-    train_dataset = Subset(dataset, np.where(is_train)[0])
-    eval_dataset = Subset(dataset, np.where(~is_train)[0])
-
-
-    # # Split dataset into train and eval (80 percent of task_ids for training, 20 percent for eval)
-    # task_ids = dataset.task_ids
-    # unique_task_ids = list(set(task_ids))
-
-    # # shuffle randomly (80-20 split)
-    # np.random.seed(42)
-    # np.random.shuffle(unique_task_ids)
-    # split_idx = int(0.8 * len(unique_task_ids))
-    # train_task_ids = set(unique_task_ids[:split_idx])
-    # eval_task_ids = set(unique_task_ids[split_idx:])
-    # train_indices = [i for i, t_id in enumerate(task_ids) if t_id in train_task_ids]
-    # eval_indices = [i for i, t_id in enumerate(task_ids) if t_id in eval_task_ids]
-    # train_dataset = Subset(dataset, train_indices)
-    # eval_dataset = Subset(dataset, eval_indices)
-
-
+    train_dataset, eval_dataset = create_dataset_split(dataset, dms_dir=args.dms_dir, split_ratio=0.9, seed=42)
 
     # Prepare LoRA adapters for each task
     lora_config = get_lora_config(args.task)
@@ -514,13 +517,19 @@ def main():
 
     # Re-wrap with reward model after PEFT
     model = ProteinRewardModel(base_model, hidden_size)
+
+    model.base_model.enable_input_require_grads()
+
     
-    print(f"Adapter 'adapter_task_a' added.")
+
+    print(f"Adapter {args.task} added.")
 
 
     # You can verify the adapters attached
     print("Active adapters:", model.base_model.active_adapters)
     print("PEFT config:", model.base_model.peft_config) # Shows configurations for all attached adapters
+
+
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -529,34 +538,25 @@ def main():
         per_device_eval_batch_size=args.per_device_train_batch_size,
         learning_rate=args.learning_rate,
         logging_steps=args.logging_steps,
-        eval_strategy="steps",     # <- correct name
+        eval_strategy="steps",    
         eval_steps=args.save_steps,
         save_steps=args.save_steps,
         report_to="wandb",
-        fp16=True,                       # or bf16=True, but be careful with 8-bit
-        remove_unused_columns=False,    # important for custom collate_fn
-        dataloader_num_workers=4,        # Speed up data loading
-        gradient_checkpointing=True,    # Turn on if OOM, off for speed
+        remove_unused_columns=False,    
+        gradient_checkpointing=False,   # Disable to avoid DDP parameter reuse issues with LoRA
+        ddp_find_unused_parameters=True,  # change based on lora-config : if MLP then True else False (Attention) Because some experts (trainable params) might not be used in the forward pass if you do MLP 
+        gradient_accumulation_steps=2, 
+        dataloader_num_workers=1,      
+        dataloader_drop_last=True,
         label_names=["labels"],            # Explicitly tell Trainer to pass 'labels' to compute_metrics
+        bf16=True,                      
+        bf16_full_eval=True,          
+        eval_accumulation_steps=1, 
     )
 
 
-
-
-
-    # --- Training Phase 1: Train only adapter_task_a ---
-    print("\n--- Training Adapter A ---")
-    # Ensure only LoRA parameters and regression head are trainable
-    for name, param in model.named_parameters():
-        if 'lora' in name:
-            param.requires_grad = True
-        elif 'score_head' in name:
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
-
     # Trainer
-    trainer = Trainer(
+    trainer = CustomRewardTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -569,9 +569,16 @@ def main():
     trainer.train()
 
     # Save
-    model.save_pretrained(args.output_dir)
-    print(f"Model saved to {args.output_dir}")
+    # Only the main process (Rank 0) should write to disk
+    if trainer.args.process_index == 0:
+        print(f"Saving model to {args.output_dir}")
+        model.save_pretrained(args.output_dir)
+        
+        # If you need to save the score_head separately (since it's custom):
+        torch.save(model.score_head.state_dict(), Path(args.output_dir) / "score_head.pt")
 
 
 if __name__ == "__main__":
     main()
+
+
