@@ -48,9 +48,9 @@ We train using a **Bradley–Terry contrastive loss**, which optimizes relative 
 
 ## Training & Evaluation Curves
 
-Interactive training and evaluation metrics are available in the W&B report:
+![Training Loss](Results/3b-eval-spearman.png)
+![Training Loss](Results/170m-eval-spearman.png)
 
-👉 **[View W&B Report]([https://wandb.ai/mhrezaei1/huggingface/reports/eval-spearman-25-12-15-02-41-55---VmlldzoxNTM3MzgwMg]))**
 
 
 ## Key Observations
