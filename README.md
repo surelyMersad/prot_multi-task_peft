@@ -46,6 +46,13 @@ We train using a **Bradley–Terry contrastive loss**, which optimizes relative 
 
 ---
 
+## Training & Evaluation Curves
+
+Interactive training and evaluation metrics are available in the W&B report:
+
+👉 **[View W&B Report]([https://wandb.ai/USERNAME/PROJECT/reports/REPORT_NAME--REPORT_ID](https://wandb.ai/mhrezaei1/huggingface/runs/4u21xt43?nw=nwusermabbasi27))**
+
+
 ## Key Observations
 
 1. **Contrastive Loss Improves Learning**  
