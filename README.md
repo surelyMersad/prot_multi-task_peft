@@ -48,7 +48,10 @@ We train using a **Bradley–Terry contrastive loss**, which optimizes relative 
 
 ## Training & Evaluation Curves
 
+- **3B-GR-HM-c** 
 ![Training Loss](Results/3b-eval-spearman.png)
+
+- **170M-UR50-BRq**
 ![Training Loss](Results/170m-eval-spearman.png)
 
 
